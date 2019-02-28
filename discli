@@ -1,0 +1,184 @@
+#! /usr/bin/env python3
+
+import argparse
+import json
+import logging
+import os
+import os.path
+import requests
+import sys
+import textwrap
+import yaml
+from urllib.parse import urljoin
+
+
+dotfile = ".discli"
+
+
+class DiscourseHelper:
+
+    def __init__(self):
+        parser = argparse.ArgumentParser(
+            description='Helper to work with discourse files locally',
+            usage=textwrap.dedent('''
+                dh <command> [<args>]
+
+                The commands are:
+                   init      Record your api key and target discourse
+                   get       Get the file
+                   put       Put a file back
+                '''))
+        parser.add_argument('command', help='Subcommand to run')
+        # parse_args defaults to [1:] for args, but you need to
+        # exclude the rest of the args too, or validation will fail
+        args = parser.parse_args(sys.argv[1:2])
+        if not hasattr(self, args.command):
+            print('Unrecognized command')
+            parser.print_help()
+            exit(1)
+        # use dispatch pattern to invoke method with same name
+        getattr(self, args.command)()
+
+    @property
+    def _identity_path(self):
+        return os.path.expanduser("~/.local/share/discli")
+
+    @property
+    def _identity_file(self):
+        return os.path.join(self._identity_path, 'identity')
+
+    @property
+    def identity(self):
+        # TODO: cached property?
+        with open(self._identity_file) as f:
+            return yaml.load(f)
+
+    @property
+    def api_auth(self):
+        identity = self.identity
+        return {'api_key': identity['api-key'], 'api_username': identity['username']}
+
+    @property
+    def discourse_url(self):
+        return self.identity['url']
+
+    def init(self):
+        parser = argparse.ArgumentParser(
+            description='Record your api key and target discourse')
+        parser.add_argument("url", help="discourse url")
+        parser.add_argument("username", help="discourse username")
+        parser.add_argument("api_key", help="discourse api key")
+        args = parser.parse_args(sys.argv[2:])
+        # TODO: optional file for identity to allow multiple discourses
+        os.makedirs(self._identity_path, exist_ok=True)
+        with open(self._identity_file, 'w') as f:
+            yaml.dump({
+                'api-key': args.api_key,
+                'username': args.username,
+                'url': args.url,
+            }, f, default_flow_style=False)
+        print("Values set: {}".format(self.identity))
+
+    def get(self):
+        parser = argparse.ArgumentParser(
+            description='get a single post')
+        parser.add_argument("topic", help="topic id of the discourse post", type=int)
+        args = parser.parse_args(sys.argv[2:])
+        post_id = self.get_topic_first_post(args.topic)
+        data = self.get_post(post_id)
+        slug = data['topic_slug']
+        id = data['id']
+        filename = f"{args.topic}-{slug}.md"
+        metadata = {
+            'id': id,
+            'slug': slug,
+            'filename': filename,
+            'updated_at': data['updated_at'],
+        }
+        self.update_metadata(args.topic, metadata)
+        with open(filename, "w") as f:
+            content = data['raw']
+            if content[-1] != '\n':
+                content += '\n'
+            f.write(content)
+
+    def put(self):
+        parser = argparse.ArgumentParser(
+            description='get a single post')
+        parser.add_argument("topic", help="topic id or filename of the discourse post")
+        args = parser.parse_args(sys.argv[2:])
+
+        topic_id, local = self.get_topic_metadata(args.topic)
+        data = self.get_post(local['id'])
+
+        if data['updated_at'] != local['updated_at']:
+            raise RuntimeError("topic was updated at {} within discourse, aborting".format(data['updated_at']))
+        filename = local['filename']
+        with open(filename) as f:
+            content = f.read()
+            self.put_post(local['id'], content)
+        self.update_metadata(topic_id, None)
+        os.remove(filename)
+
+    def get_post(self, id):
+        post_path = urljoin(self.identity["url"], f"posts/{id}.json")
+        r = requests.get(post_path, params=self.api_auth)
+        if r.status_code == 200:
+            return json.loads(r.text)
+        raise RuntimeError("couldn't get post {}: status code {}", id, r.status_code)
+
+    def put_post(self, id, content):
+        post_path = urljoin(self.identity["url"], f"posts/{id}.json")
+
+        data = self.api_auth
+        data["post[raw]"] = content
+        resp = requests.put(post_path, data=data)
+        if resp.status_code != 200:
+            raise RuntimeError("couldn't update post {}: status code {}", id, r.status_code)
+
+    def get_topic_first_post(self, id):
+        post_path = urljoin(self.identity["url"], f"t/{id}.json")
+        r = requests.get(post_path, params=self.api_auth)
+        if r.status_code == 200:
+            topic = json.loads(r.text)
+            first_post = topic['post_stream']['posts'][0]
+            return first_post['id']
+        raise RuntimeError("couldn't get topic {}: status code {}", id, r.status_code)
+
+    def update_metadata(self, post, data):
+        info = self.dotfile_contents()
+        if data is None:
+            del info[post]
+        else:
+            info[post] = data
+        with open(dotfile, "w") as f:
+            yaml.dump(info, f, default_flow_style=False)
+
+    def dotfile_contents(self):
+        if not os.path.exists(dotfile):
+            return {}
+        with open(dotfile) as f:
+            return yaml.load(f)
+
+    def read_metadata(self, post):
+        info = self.dotfile_contents()
+        if post in info:
+            return info[post]
+        return {}
+
+    def get_topic_metadata(self, topic):
+        # topic is either the topic number or the name of the file.
+        info = self.dotfile_contents()
+        try:
+            topic_id = int(topic)
+            return topic_id, info[topic_id] 
+        except:
+            for id, meta in info.items():
+                if meta['filename'] == topic:
+                    return id, meta
+
+        raise RuntimeError(f"{topic} is neither a topic id nor a known filename")
+
+
+if __name__ == '__main__':
+    DiscourseHelper()
