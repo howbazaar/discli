@@ -2,9 +2,11 @@
 
 import argparse
 import json
-import logging
 import os
+import re
+import time
 import os.path
+import glob
 import requests
 import sys
 import textwrap
@@ -27,6 +29,7 @@ class DiscourseHelper:
                    init      Record your api key and target discourse
                    get       Get the file
                    put       Put a file back
+                   get_posts_in_category  Get all the posts in the given category name
                 '''))
         parser.add_argument('command', help='Subcommand to run')
         # parse_args defaults to [1:] for args, but you need to
@@ -84,18 +87,23 @@ class DiscourseHelper:
             description='get a single post')
         parser.add_argument("topic", help="topic id of the discourse post", type=int)
         args = parser.parse_args(sys.argv[2:])
-        post_id = self.get_topic_first_post(args.topic)
+        self.save_topic_as_file(args.topic)
+    
+    def save_topic_as_file(self, topic_id):
+        post_id = self.get_topic_first_post(topic_id)
         data = self.get_post(post_id)
         slug = data['topic_slug']
         id = data['id']
-        filename = f"{args.topic}-{slug}.md"
+        filename = f"{topic_id}-{slug}.md"
         metadata = {
             'id': id,
             'slug': slug,
             'filename': filename,
             'updated_at': data['updated_at'],
         }
-        self.update_metadata(args.topic, metadata)
+        self.update_metadata(topic_id, metadata)
+
+        print(f"Saving {filename}")
         with open(filename, "w") as f:
             content = data['raw']
             if content[-1] != '\n':
@@ -121,11 +129,68 @@ class DiscourseHelper:
         os.remove(filename)
 
     def get_post(self, id):
-        post_path = urljoin(self.identity["url"], f"posts/{id}.json")
-        r = requests.get(post_path, params=self.api_auth)
-        if r.status_code == 200:
-            return json.loads(r.text)
-        raise RuntimeError("couldn't get post {}: status code {}", id, r.status_code)
+        response = self.request(f"posts/{id}.json")
+        if response.status_code == 200:
+            return json.loads(response.text)
+        raise RuntimeError("couldn't get post {}: status code {}", id, response.status_code)
+
+    def get_posts_in_category(self):
+        """
+        Get all the posts in a category
+        """
+
+        parser = argparse.ArgumentParser(description='get all posts in category')
+        parser.add_argument("category", help="name of the category to get posts from", type=str)
+        args = parser.parse_args(sys.argv[2:])
+
+        for page in range(1, 20):
+            print(f"Getting page {page} of results...")
+            response = self.request(f"/search.json?q=category%3A{args.category}&page={page}")
+
+            if response.status_code != 200:
+                raise RuntimeError("couldn't get category posts {}: status code {}", id, response.status_code)
+
+            results = response.json()
+
+            if 'topics' not in results:
+                break
+
+            topics = results['topics']
+
+            for topic in topics:
+                if glob.glob(f"{topic['id']}-*.md"):
+                    print(f"File for topic {topic['id']} already exists. Skipping.")
+                    continue
+
+                self.save_topic_as_file(topic["id"])
+
+    def request(self, path):
+        """
+        Use requests to fetch an API URL,
+        padding in the auth token,
+        and retrying if we get a 429 response
+        """
+
+        response = None
+
+        while response is None or response.status_code == 429:
+            if response is not None and response.status_code == 429:
+                seconds = 5
+                error_message = response.json()["errors"][0]
+                seconds_match = re.search("wait (\d+) seconds", error_message)
+
+                if seconds_match:
+                    seconds = int(seconds_match.groups()[0]) + 1
+
+                print(
+                    f"  > 429 from API, waiting {seconds} seconds ... "
+                    f"('{response.json()['errors']}')"
+                )
+                time.sleep(seconds)
+
+            response = requests.get(urljoin(self.identity["url"], path), params=self.api_auth)
+
+        return response
 
     def put_post(self, id, content):
         post_path = urljoin(self.identity["url"], f"posts/{id}.json")
@@ -137,8 +202,7 @@ class DiscourseHelper:
             raise RuntimeError("couldn't update post {}: status code {}", id, r.status_code)
 
     def get_topic_first_post(self, id):
-        post_path = urljoin(self.identity["url"], f"t/{id}.json")
-        r = requests.get(post_path, params=self.api_auth)
+        r = self.request(f"t/{id}.json")
         if r.status_code == 200:
             topic = json.loads(r.text)
             first_post = topic['post_stream']['posts'][0]
