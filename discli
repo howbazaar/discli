@@ -23,7 +23,7 @@ class DiscourseHelper:
         parser = argparse.ArgumentParser(
             description='Helper to work with discourse files locally',
             usage=textwrap.dedent('''
-                dh <command> [<args>]
+                discli <command> [<args>]
 
                 The commands are:
                    init      Record your api key and target discourse
