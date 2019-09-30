@@ -1,1 +1,15 @@
 .discli
+
+#python
+*.pyc
+*.pyx
+*.pyo
+
+# build artifacts
+build/
+discli.egg-info/
+dist/
+
+# editors, etc
+.idea/
+.vscode/
